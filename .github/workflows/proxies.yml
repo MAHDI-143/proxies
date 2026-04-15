@@ -16,5 +16,5 @@ jobs:
         git config user.email "bot@github.com"
         git config user.name "GitHub Bot"
         git add proxies.txt
-        git diff --quiet && git diff --staged --quiet || git commit -m "update"
+        git diff --quiet && git diff --staged --quiet || git commit -m "update proxies"
         git push
