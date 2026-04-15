@@ -11,9 +11,10 @@ jobs:
     - run: curl -s "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http" > proxies.txt
     - run: curl -s "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt" >> proxies.txt
     - run: sort -u proxies.txt -o proxies.txt
-    - run: |
-        git config user.email "bot@github.com"
-        git config user.name "GitHub Bot"
+    - name: Commit and push
+      run: |
+        git config --global user.email "bot@github.com"
+        git config --global user.name "GitHub Bot"
         git add proxies.txt
-        git diff --quiet && git diff --staged --quiet || git commit -m "update proxies"
-        git push
+        git commit -m "update proxies" || echo "No changes to commit"
+        git push https://MAHDI-143:${{ secrets.GITHUB_TOKEN }}@github.com/MAHDI-143/proxies.git
