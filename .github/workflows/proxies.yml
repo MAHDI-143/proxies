@@ -10,11 +10,14 @@ jobs:
       contents: write
     steps:
     - uses: actions/checkout@v4
-    - name: Download latest working proxies
-      run: |
-        # This file is updated hourly with freshly tested, working proxies [citation:4]
-        curl -s "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt" > proxies.txt
-        echo "✅ Downloaded $(wc -l < proxies.txt) proxies"
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install requests
+      run: pip install requests
+    - name: Run scraper
+      run: python scraper.py
     - name: Commit and push
       run: |
         git config user.email "bot@github.com"
