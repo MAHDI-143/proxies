@@ -10,9 +10,55 @@ jobs:
       contents: write
     steps:
     - uses: actions/checkout@v4
-    - run: curl -s "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http" > proxies.txt
-    - run: curl -s "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt" >> proxies.txt
-    - run: sort -u proxies.txt -o proxies.txt
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install requests
+      run: pip install requests
+    - name: Scrape and test proxies
+      run: |
+        python -c "
+import requests, re
+from concurrent.futures import ThreadPoolExecutor
+
+print('Fetching proxies...')
+sources = [
+    'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http',
+    'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
+]
+
+all_proxies = set()
+for url in sources:
+    try:
+        r = requests.get(url, timeout=10)
+        found = re.findall(r'\d+\.\d+\.\d+\.\d+:\d+', r.text)
+        all_proxies.update(found)
+        print(f'  Got {len(found)} proxies')
+    except: pass
+
+print(f'Total raw proxies: {len(all_proxies)}')
+print('Testing proxies (this takes ~1 min)...')
+
+def test_proxy(proxy):
+    try:
+        r = requests.get('http://httpbin.org/ip', proxies={'http': f'http://{proxy}'}, timeout=5)
+        return proxy if r.status_code == 200 else None
+    except:
+        return None
+
+working = []
+with ThreadPoolExecutor(max_workers=50) as executor:
+    futures = [executor.submit(test_proxy, p) for p in list(all_proxies)[:500]]
+    for future in futures:
+        result = future.result()
+        if result:
+            working.append(result)
+
+with open('proxies.txt', 'w') as f:
+    f.write('\n'.join(working))
+print(f'✅ Saved {len(working)} WORKING proxies')
+"
     - run: |
         git config user.email "bot@github.com"
         git config user.name "GitHub Bot"
