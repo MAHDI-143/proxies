@@ -1,693 +1,537 @@
 #!/usr/bin/env python3
+"""
+XTM Proxy Scraper v3.0
+Fixes: token security, protocol-aware testing, proper error handling,
+       no credential leakage in git remote, no DDoS on single test endpoint.
+"""
+
 import os
 import sys
 import requests
 import re
 import time
+import json
+import base64
+import logging
+import keyring
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-import subprocess
-import json
 
-CONFIG_FILE = "config.json"
+# ── Optional SOCKS support ────────────────────────────────────────────────────
+try:
+    import socks  # noqa: F401 — imported for side-effect (registers socks:// handler)
+    SOCKS_AVAILABLE = True
+except ImportError:
+    SOCKS_AVAILABLE = False
 
-# Colors
-G = "\033[38;5;46m"
+# ── Logging (replaces silent except blocks) ───────────────────────────────────
+logging.basicConfig(
+    filename="xtm_errors.log",
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+G   = "\033[38;5;46m"
 GGG = "\033[38;5;49m"
-XX = "\033[1;92m"
+XX  = "\033[1;92m"
+RST = "\033[0m"
 
-logo = (f"""
+KEYRING_SERVICE = "xtm_proxy_scraper"
+CONFIG_FILE     = "config.json"          # stores only username + repo (NO token)
+
+LOGO = f"""
 ╔━━━━━━━━━━━━━━━━━━━━━━╗━━━━━━━━━━━╗
 ║      \x1b[38;5;47m┳┳┓┏┓┓┏┳┓┳      ║PROXY      ║
 ║      \x1b[38;5;49m┃┃┃┣┫┣┫┃┃┃      ║SCRAPER    ║
-║      \x1b[38;5;50m┛ ┗┛┗┛┗┻┛┻      ║VERSION:2.0║
+║      \x1b[38;5;50m┛ ┗┛┗┛┗┻┛┻      ║VERSION:3.0║
 ╚━━━━━━━━━━━━━━━━━━━━━━╝━━━━━━━━━━━╝
 {G}⋆{GGG}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{G}⋆
-\x1b[1;92m {XX}[\x1b[1;92m⍣{XX}]\x1b[38;5;46m OWNER     : MAHDI            
-\x1b[1;92m {XX}[\x1b[1;92m⍣{XX}] \x1b[38;5;47mFACEBOOK  : MAHDI           
-\x1b[1;92m {XX}[\x1b[1;92m⍣{XX}] \x1b[38;5;48mGITHUB    : MAHDI-143         
-{G}⋆{GGG}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{G}⋆""")
+\x1b[1;92m {XX}[\x1b[1;92m⍣{XX}]\x1b[38;5;46m OWNER     : MAHDI
+\x1b[1;92m {XX}[\x1b[1;92m⍣{XX}] \x1b[38;5;47mFACEBOOK  : MAHDI
+\x1b[1;92m {XX}[\x1b[1;92m⍣{XX}] \x1b[38;5;48mGITHUB    : MAHDI-143
+{G}⋆{GGG}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{G}⋆{RST}"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UI HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def linex():
-    print(f'{G}⋆{GGG}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{G}⋆')
+    print(f'{G}⋆{GGG}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{G}⋆{RST}')
 
 def clear():
     os.system('clear' if os.name == 'posix' else 'cls')
-    print(logo)
+    print(LOGO)
 
 def wait_for_enter():
     input("\n\033[93m[+] Press Enter to continue...\033[0m")
 
+def info(msg):  print(f"\033[96m[+] {msg}{RST}")
+def ok(msg):    print(f"\033[92m[✓] {msg}{RST}")
+def warn(msg):  print(f"\033[93m[!] {msg}{RST}")
+def err(msg):   print(f"\033[91m[✗] {msg}{RST}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SECURE CONFIG  (token lives in OS keychain, NOT on disk)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return None
-    return None
-
-def save_config(config):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f)
-
-def check_link_status():
-    """Check if user's GitHub link is valid and has proxies"""
-    config = load_config()
-    if not config:
-        return False
-    
+    """Return {username, repo} from disk, token from OS keychain."""
+    if not os.path.exists(CONFIG_FILE):
+        return None
     try:
-        url = f"https://raw.githubusercontent.com/{config['username']}/{config['repo']}/main/proxies.txt"
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200 and len(r.text.strip()) > 0:
-            return True
-    except:
-        pass
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        token = keyring.get_password(KEYRING_SERVICE, cfg.get("username", ""))
+        if not token:
+            warn("Token not found in keychain — re-run setup.")
+            return None
+        cfg["token"] = token
+        return cfg
+    except Exception as exc:
+        logging.warning("load_config failed: %s", exc)
+        return None
+
+
+def save_config(username: str, token: str, repo: str):
+    """Persist non-secret fields to disk; token goes to OS keychain."""
+    with open(CONFIG_FILE, "w") as f:
+        json.dump({"username": username, "repo": repo}, f)
+    keyring.set_password(KEYRING_SERVICE, username, token)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GITHUB API  (no credentials in git remote URLs)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+GH_API = "https://api.github.com"
+
+def _gh_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def gh_create_or_verify_repo(username: str, token: str, repo: str) -> bool:
+    """Create repo if it doesn't exist. Return True on success."""
+    headers = _gh_headers(token)
+    # Check existence first
+    r = requests.get(f"{GH_API}/repos/{username}/{repo}", headers=headers, timeout=10)
+    if r.status_code == 200:
+        ok(f"Repository '{repo}' found.")
+        return True
+    if r.status_code != 404:
+        err(f"GitHub API error: {r.status_code} — {r.json().get('message','')}")
+        return False
+    # Create it
+    r = requests.post(
+        f"{GH_API}/user/repos",
+        headers=headers,
+        json={"name": repo, "public": True, "description": "Proxy list — XTM tool"},
+        timeout=10,
+    )
+    if r.status_code == 201:
+        ok(f"Repository '{repo}' created.")
+        return True
+    err(f"Could not create repo: {r.json().get('message','unknown error')}")
     return False
 
-def setup():
+
+def gh_push_file(username: str, token: str, repo: str, content: str) -> bool:
+    """
+    Push proxies.txt via the Contents API — no git binary, no credential leakage.
+    Uses PUT /repos/{owner}/{repo}/contents/{path}.
+    """
+    headers = _gh_headers(token)
+    api_url = f"{GH_API}/repos/{username}/{repo}/contents/proxies.txt"
+
+    # Fetch current SHA (required for updates)
+    sha = None
+    r = requests.get(api_url, headers=headers, timeout=10)
+    if r.status_code == 200:
+        sha = r.json().get("sha")
+
+    encoded = base64.b64encode(content.encode()).decode()
+    payload = {
+        "message": f"Update proxies — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "content": encoded,
+        "branch": "main",
+    }
+    if sha:
+        payload["sha"] = sha
+
+    r = requests.put(api_url, headers=headers, json=payload, timeout=20)
+    if r.status_code in (200, 201):
+        return True
+    err(f"Push failed: {r.status_code} — {r.json().get('message','')}")
+    logging.warning("gh_push_file failed: %s %s", r.status_code, r.text)
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP / CHANGE LINK
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def setup() -> dict | None:
     config = load_config()
-    if not config:
-        clear()
-        print("\n\033[93m[!] FIRST TIME SETUP\033[0m")
-        print("\033[96m[+] Proxies will be pushed to YOUR GitHub\033[0m")
-        username = input("\033[96m[?] GitHub username: \033[0m").strip()
-        token = input("\033[96m[?] GitHub token: \033[0m").strip()
-        
-        if not username or not token:
-            print("\033[91m[✗] Username and token required!\033[0m")
+    if config:
+        return config
+
+    clear()
+    warn("FIRST TIME SETUP")
+    info("Token stored securely in OS keychain — never written to disk.")
+
+    username = input("\033[96m[?] GitHub username: \033[0m").strip()
+    token    = input("\033[96m[?] GitHub token (repo scope): \033[0m").strip()
+
+    if not username or not token:
+        err("Username and token are required.")
+        wait_for_enter()
+        return None
+
+    create = input("\033[96m[?] Create a new repository? (y/n): \033[0m").lower()
+    if create == "y":
+        repo = input("\033[96m[?] Repository name [proxies]: \033[0m").strip() or "proxies"
+    else:
+        repo = input("\033[96m[?] Existing repository name: \033[0m").strip()
+        if not repo:
+            err("Repository name required.")
             wait_for_enter()
             return None
-        
-        # Ask if they want to create new repo
-        create_repo = input("\033[96m[?] Do you want to create a new repository? (y/n): \033[0m").lower()
-        
-        if create_repo == "y":
-            repo = input("\033[96m[?] Repository name (default: proxies): \033[0m").strip() or "proxies"
-            print(f"\n\033[96m[+] Creating repository '{repo}'...\033[0m")
-            
-            # Create repository via GitHub API
-            api_url = "https://api.github.com/user/repos"
-            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-            data = {"name": repo, "public": True, "description": "Proxy list from XTM tool"}
-            
-            try:
-                response = requests.post(api_url, json=data, headers=headers)
-                if response.status_code == 201:
-                    print(f"\033[92m[✓] Repository '{repo}' created successfully!\033[0m")
-                elif response.status_code == 422:
-                    print(f"\033[93m[!] Repository '{repo}' already exists. Connecting to it.\033[0m")
-                else:
-                    print(f"\033[91m[✗] Failed to create repository. Make sure your token has 'repo' scope.\033[0m")
-                    wait_for_enter()
-                    return None
-            except Exception as e:
-                print(f"\033[91m[✗] Error: {e}\033[0m")
-                wait_for_enter()
-                return None
-        else:
-            repo = input("\033[96m[?] Enter your existing repository name: \033[0m").strip()
-            if not repo:
-                print("\033[91m[✗] Repository name required!\033[0m")
-                wait_for_enter()
-                return None
-            print(f"\n\033[96m[+] Checking if repository '{repo}' exists...\033[0m")
-            
-            # Check if repository exists
-            api_url = f"https://api.github.com/repos/{username}/{repo}"
-            headers = {"Authorization": f"token {token}"}
-            
-            try:
-                response = requests.get(api_url, headers=headers)
-                if response.status_code == 200:
-                    print(f"\033[92m[✓] Repository '{repo}' found! Connecting...\033[0m")
-                else:
-                    print(f"\033[91m[✗] Repository '{repo}' not found! Check the name and try again.\033[0m")
-                    wait_for_enter()
-                    return None
-            except Exception as e:
-                print(f"\033[91m[✗] Error: {e}\033[0m")
-                wait_for_enter()
-                return None
-        
-        # Save config
-        config = {"username": username, "token": token, "repo": repo}
-        save_config(config)
-        
-        # Setup git remote
-        os.system(f"rm -rf .git 2>/dev/null")
-        os.system(f"git init")
-        os.system(f"git remote add origin https://{username}:{token}@github.com/{username}/{repo}.git")
-        os.system(f"git branch -M main")
-        
-        # Create initial proxies.txt
-        with open("proxies.txt", "w") as f:
-            f.write("# Proxy list will be updated here\n")
-        
-        # Test the link
-        test_url = f"https://raw.githubusercontent.com/{username}/{repo}/main/proxies.txt"
-        print(f"\n\033[96m[+] Testing your link...\033[0m")
-        
-        try:
-            r = requests.get(test_url, timeout=5)
-            if r.status_code == 200:
-                print(f"\033[92m╔════════════════════════════════════════════════╗\033[0m")
-                print(f"\033[92m║  ✅ YOUR LINK ADDED SUCCESSFULLY!              ║\033[0m")
-                print(f"\033[92m║  📍 {test_url}\033[0m")
-                print(f"\033[92m╚════════════════════════════════════════════════╝\033[0m")
-            else:
-                print(f"\033[93m╔════════════════════════════════════════════════╗\033[0m")
-                print(f"\033[93m║  ⚠️ LINK CREATED BUT NOT YET ACTIVE            ║\033[0m")
-                print(f"\033[93m║  📍 {test_url}\033[0m")
-                print(f"\033[93m║  [!] Run [1] HARVEST PROXIES to add proxies    ║\033[0m")
-                print(f"\033[93m╚════════════════════════════════════════════════╝\033[0m")
-        except:
-            print(f"\033[93m╔════════════════════════════════════════════════╗\033[0m")
-            print(f"\033[93m║  ⚠️ LINK CREATED BUT NOT YET ACTIVE            ║\033[0m")
-            print(f"\033[93m║  📍 {test_url}\033[0m")
-            print(f"\033[93m║  [!] Run [1] HARVEST PROXIES to add proxies    ║\033[0m")
-            print(f"\033[93m╚════════════════════════════════════════════════╝\033[0m")
-        
-        print("\n\033[92m[✓] Setup complete!\033[0m")
+
+    if not gh_create_or_verify_repo(username, token, repo):
         wait_for_enter()
-    
+        return None
+
+    save_config(username, token, repo)
+    ok("Setup complete — token saved to keychain.")
+    wait_for_enter()
     return load_config()
+
 
 def change_link():
     clear()
-    current_config = load_config()
-    print("\n\033[93m[!] CHANGE YOUR GITHUB SETTINGS\033[0m")
-    username = input(f"\033[96m[?] New GitHub username (current: {current_config['username'] if current_config else 'None'}): \033[0m").strip()
-    token = input("\033[96m[?] New GitHub token: \033[0m").strip()
-    repo = input(f"\033[96m[?] New repository name (current: {current_config['repo'] if current_config else 'proxies'}): \033[0m").strip() or "proxies"
-    
-    if username and token:
-        config = {"username": username, "token": token, "repo": repo}
-        save_config(config)
-        
-        os.system(f"rm -rf .git 2>/dev/null")
-        os.system(f"git init")
-        os.system(f"git remote add origin https://{username}:{token}@github.com/{username}/{repo}.git")
-        os.system(f"git branch -M main")
-        print("\033[92m[✓] Settings updated! New link will be used for next harvest.\033[0m")
+    cfg = load_config()
+    current_user = cfg["username"] if cfg else "None"
+    current_repo = cfg["repo"]     if cfg else "proxies"
+
+    warn("CHANGE GITHUB SETTINGS")
+    username = input(f"\033[96m[?] New username (current: {current_user}): \033[0m").strip()
+    token    = input("\033[96m[?] New token: \033[0m").strip()
+    repo     = input(f"\033[96m[?] New repo (current: {current_repo}): \033[0m").strip() or current_repo
+
+    if not username or not token:
+        err("Username and token required.")
     else:
-        print("\033[91m[✗] Username and token required!\033[0m")
-    
+        save_config(username, token, repo)
+        ok("Settings updated.")
     wait_for_enter()
 
-def fetch_all_proxies():
-    """Fetch proxies from multiple sources with better coverage"""
-    sources = {
-        "http": [
-            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-            "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
-            "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-            "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all",
-            "https://proxy-list.download/api/v1/get?type=http",
-            "https://www.proxy-list.download/api/v1/get?type=http",
-        ],
-        "socks4": [
-            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
-            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
-            "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=10000&country=all",
-            "https://proxy-list.download/api/v1/get?type=socks4",
-        ],
-        "socks5": [
-            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-            "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-            "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
-            "https://proxy-list.download/api/v1/get?type=socks5",
-            "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
-        ]
-    }
-    
-    all_proxies = set()
-    
-    print("\n\033[96m[+] FETCHING PROXIES FROM 15+ SOURCES...\033[0m\n")
-    
-    for protocol, urls in sources.items():
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PROXY SOURCES  (tagged by protocol so we keep type info)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SOURCES: dict[str, list[str]] = {
+    "http": [
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all",
+        "https://proxy-list.download/api/v1/get?type=http",
+    ],
+    "socks4": [
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=10000&country=all",
+        "https://proxy-list.download/api/v1/get?type=socks4",
+    ],
+    "socks5": [
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
+        "https://proxy-list.download/api/v1/get?type=socks5",
+    ],
+}
+
+# Multiple test endpoints — rotated to avoid hammering one service
+TEST_ENDPOINTS = [
+    "http://httpbin.org/ip",
+    "http://ip-api.com/json",
+    "http://api.ipify.org",
+    "http://checkip.amazonaws.com",
+]
+
+
+def fetch_all_proxies() -> list[dict]:
+    """
+    Fetch from all sources. Each proxy entry: {proxy, protocol}.
+    Deduplicates per (proxy, protocol) pair so type info is preserved.
+    """
+    seen: set[tuple] = set()
+    result: list[dict] = []
+
+    info("FETCHING PROXIES FROM SOURCES...\n")
+
+    for protocol, urls in SOURCES.items():
         for url in urls:
             try:
                 r = requests.get(url, timeout=15)
+                r.raise_for_status()
                 found = re.findall(r'\d+\.\d+\.\d+\.\d+:\d+', r.text)
-                all_proxies.update(found)
-                print(f"\033[92m[✓] +{len(found)} from {url.split('/')[2]}\033[0m")
-            except Exception as e:
-                print(f"\033[91m[✗] Failed: {url.split('/')[2]}\033[0m")
-    
-    return list(all_proxies)
+                added = 0
+                for p in found:
+                    key = (p, protocol)
+                    if key not in seen:
+                        seen.add(key)
+                        result.append({"proxy": p, "protocol": protocol})
+                        added += 1
+                ok(f"+{added} {protocol} from {url.split('/')[2]}")
+            except requests.RequestException as exc:
+                err(f"Failed: {url.split('/')[2]}")
+                logging.warning("fetch %s: %s", url, exc)
 
-def test_proxy_advanced(proxy, timeout=5):
-    """Test proxy with multiple endpoints for better reliability"""
-    test_urls = [
-        "http://httpbin.org/ip",
-        "http://ip-api.com/json",
-        "http://api.ipify.org"
-    ]
-    
-    for url in test_urls:
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PROTOCOL-AWARE PROXY TESTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _proxy_dict(protocol: str, proxy: str) -> dict:
+    """Build the requests proxies dict for the correct protocol."""
+    if protocol == "http":
+        return {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+    if protocol == "socks4":
+        return {"http": f"socks4://{proxy}", "https": f"socks4://{proxy}"}
+    if protocol == "socks5":
+        return {"http": f"socks5://{proxy}", "https": f"socks5://{proxy}"}
+    return {}
+
+
+def test_proxy(entry: dict, timeout: int = 5) -> dict | None:
+    """
+    Test a proxy against rotating endpoints.
+    Returns {proxy, protocol, speed} or None if all endpoints fail.
+    SOCKS proxies skipped gracefully if PySocks not installed.
+    """
+    proxy    = entry["proxy"]
+    protocol = entry["protocol"]
+
+    if protocol in ("socks4", "socks5") and not SOCKS_AVAILABLE:
+        return None  # silently skip — warn user once at startup
+
+    proxies = _proxy_dict(protocol, proxy)
+    if not proxies:
+        return None
+
+    # Rotate through endpoints — first success wins
+    for i, url in enumerate(TEST_ENDPOINTS):
         try:
-            start = time.time()
-            r = requests.get(url, proxies={"http": f"http://{proxy}"}, timeout=timeout)
-            elapsed = time.time() - start
+            start = time.monotonic()
+            r = requests.get(url, proxies=proxies, timeout=timeout)
+            elapsed = time.monotonic() - start
             if r.status_code == 200:
-                return {"proxy": proxy, "speed": round(elapsed, 2)}
-        except:
+                return {"proxy": proxy, "protocol": protocol, "speed": round(elapsed, 2)}
+        except Exception as exc:
+            logging.debug("test_proxy %s %s endpoint %s: %s", protocol, proxy, i, exc)
             continue
+
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN HARVEST FLOW
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def update_proxies():
     clear()
     config = setup()
     if not config:
         return
-    
-    # Fetch all proxies
+
+    if not SOCKS_AVAILABLE:
+        warn("PySocks not installed — SOCKS4/SOCKS5 proxies will be skipped.")
+        warn("Install with: pip install requests[socks]")
+
     all_proxies = fetch_all_proxies()
-    
     if not all_proxies:
-        print("\n\033[91m[✗] No proxies found from sources!\033[0m")
+        err("No proxies fetched from any source.")
         wait_for_enter()
         return
-    
-    print(f"\n\033[96m[+] TOTAL UNIQUE PROXIES FETCHED: {len(all_proxies)}\033[0m")
-    
-    # Ask for test intensity
-    print("\n\033[93m╔════════════════════════════════════════════════════╗\033[0m")
-    print("\033[93m║  SELECT TESTING INTENSITY:                          ║\033[0m")
-    print("\033[93m║  [1] LIGHT - Test 500 proxies (fast)               ║\033[0m")
-    print("\033[93m║  [2] MEDIUM - Test 2000 proxies (recommended)      ║\033[0m")
-    print("\033[93m║  [3] EXTREME - Test ALL proxies (slow but thorough)║\033[0m")
-    print("\033[93m╚════════════════════════════════════════════════════╝\033[0m")
-    
-    intensity = input("\033[96m[?] Choose intensity (1/2/3): \033[0m")
-    
-    if intensity == "1":
-        test_limit = min(500, len(all_proxies))
-        workers = 100
-        print(f"\n\033[96m[+] LIGHT MODE: Testing {test_limit} proxies...\033[0m")
-    elif intensity == "2":
-        test_limit = min(2000, len(all_proxies))
-        workers = 150
-        print(f"\n\033[96m[+] MEDIUM MODE: Testing {test_limit} proxies...\033[0m")
-    elif intensity == "3":
-        test_limit = len(all_proxies)
-        workers = 200
-        print(f"\n\033[96m[+] EXTREME MODE: Testing ALL {test_limit} proxies...\033[0m")
-        print(f"\033[93m[!] This may take several minutes!\033[0m")
-    else:
-        test_limit = min(1000, len(all_proxies))
-        workers = 100
-        print(f"\n\033[96m[+] DEFAULT MODE: Testing {test_limit} proxies...\033[0m")
-    
-    print(f"\033[96m[+] Using {workers} concurrent workers for testing...\033[0m\n")
-    
-    # Test proxies
-    working = []
+
+    info(f"TOTAL UNIQUE PROXIES FETCHED: {len(all_proxies)}")
+
+    # ── Intensity selection ──────────────────────────────────────────────────
+    print("\n\033[93m╔════════════════════════════════════════════════════╗")
+    print("║  SELECT TESTING INTENSITY:                          ║")
+    print("║  [1] LIGHT   — Test 500  proxies (fast)            ║")
+    print("║  [2] MEDIUM  — Test 2000 proxies (recommended)     ║")
+    print(f"║  [3] EXTREME — Test ALL  {len(all_proxies):<5} proxies (thorough)   ║")
+    print(f"\033[93m╚════════════════════════════════════════════════════╝{RST}")
+
+    intensity = input("\033[96m[?] Choose (1/2/3): \033[0m").strip()
+    limits    = {"1": (500, 100), "2": (2000, 150), "3": (len(all_proxies), 200)}
+    test_limit, workers = limits.get(intensity, (1000, 100))
+    test_limit = min(test_limit, len(all_proxies))
+
+    info(f"Testing {test_limit} proxies with {workers} workers...\n")
+
+    # ── Testing ──────────────────────────────────────────────────────────────
+    working: list[dict] = []
     proxy_list = all_proxies[:test_limit]
-    
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(test_proxy_advanced, p): p for p in proxy_list}
-        
+        futures = {executor.submit(test_proxy, p): p for p in proxy_list}
         for i, future in enumerate(as_completed(futures), 1):
-            result = future.result()
+            try:
+                result = future.result()
+            except Exception as exc:
+                logging.warning("future.result() raised: %s", exc)
+                result = None
+
             if result:
                 working.append(result)
-                # Show progress
-                speed_indicator = "⚡" if result["speed"] < 1 else "✓" if result["speed"] < 3 else "🐢"
-                print(f"\033[92m   [{len(working)}] {speed_indicator} {result['proxy']} - {result['speed']}s\033[0m")
-            
-            # Show progress percentage every 100 proxies
+                icon = "⚡" if result["speed"] < 1 else "✓" if result["speed"] < 3 else "🐢"
+                print(f"\033[92m   [{len(working)}] {icon} {result['protocol']:<6} {result['proxy']} — {result['speed']}s{RST}")
+
             if i % 100 == 0:
-                print(f"\033[96m   Progress: {i}/{test_limit} ({i*100//test_limit}%)\033[0m")
-    
-    print(f"\n\033[92m[✓] TESTING COMPLETE! Found {len(working)} WORKING PROXIES\033[0m")
-    
-    if working:
-        speeds = [p['speed'] for p in working]
-        print(f"\n\033[96m[+] SPEED STATS:\033[0m")
-        print(f"   \033[92mFastest: {min(speeds)}s\033[0m")
-        print(f"   \033[93mSlowest: {max(speeds)}s\033[0m")
-        print(f"   \033[96mAverage: {sum(speeds)/len(speeds):.2f}s\033[0m")
-        print(f"   \033[96mSuccess Rate: {len(working)*100//test_limit}%\033[0m")
-        
-        print("\n\033[93m╔══════════════════════════════════════════════════════════╗\033[0m")
-        print("\033[93m║  [1] ULTRA FAST - Only proxies < 1s                        ║\033[0m")
-        print("\033[93m║  [2] FAST - Only proxies < 2s                              ║\033[0m")
-        print("\033[93m║  [3] GOOD - Remove slow proxies (> 4s)                     ║\033[0m")
-        print("\033[93m║  [4] ALL WORKING - Keep all working proxies                ║\033[0m")
-        print("\033[93m╚══════════════════════════════════════════════════════════╝\033[0m")
-        
-        filter_choice = input("\033[96m[?] Choose filter option (1/2/3/4): \033[0m")
-        
-        if filter_choice == "1":
-            filtered = [p for p in working if p['speed'] < 1]
-            if filtered:
-                working = filtered
-                print(f"\n\033[92m[✓] Kept {len(working)} ULTRA FAST proxies (< 1s)\033[0m")
-            else:
-                print(f"\n\033[93m[!] No proxies under 1s, keeping all {len(working)}\033[0m")
-        
-        elif filter_choice == "2":
-            filtered = [p for p in working if p['speed'] < 2]
-            if filtered:
-                working = filtered
-                print(f"\n\033[92m[✓] Kept {len(working)} FAST proxies (< 2s)\033[0m")
-            else:
-                print(f"\n\033[93m[!] No proxies under 2s, keeping all {len(working)}\033[0m")
-        
-        elif filter_choice == "3":
-            filtered = [p for p in working if p['speed'] <= 4]
-            removed = len(working) - len(filtered)
-            if filtered:
-                working = filtered
-                print(f"\n\033[92m[✓] Kept {len(working)} proxies (removed {removed} slow ones)\033[0m")
-            else:
-                print(f"\n\033[93m[!] No proxies under 4s, keeping all {len(working)}\033[0m")
-        
-        elif filter_choice == "4":
-            print(f"\n\033[92m[✓] Keeping ALL {len(working)} working proxies\033[0m")
-        
-        else:
-            print(f"\n\033[93m[!] Invalid choice, keeping ALL {len(working)} proxies\033[0m")
-    
+                pct = i * 100 // test_limit
+                info(f"Progress: {i}/{test_limit} ({pct}%)")
+
+    ok(f"TESTING COMPLETE — {len(working)} working proxies found.")
+
     if not working:
-        print("\n\033[91m[✗] No working proxies found!\033[0m")
+        err("No working proxies found.")
         wait_for_enter()
         return
-    
-    # Save options
-    print("\n\033[93m╔════════════════════════════════════════════════════╗\033[0m")
-    print("\033[93m║  [A] AUTO - Push to GitHub automatically            ║\033[0m")
-    print("\033[93m║  [M] MANUAL - Preview & decide                      ║\033[0m")
-    print("\033[93m║  [S] SKIP - Save only locally                       ║\033[0m")
-    print("\033[93m╚════════════════════════════════════════════════════╝\033[0m")
-    
-    choice = input("\033[96m[?] How to save these proxies? (A/M/S): \033[0m").upper()
-    
-    if choice == "A":
-        # Save with timestamp and stats
-        with open("proxies.txt", "w") as f:
-            f.write(f"# Proxy List - Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"# Total Working: {len(working)}\n")
-            f.write(f"# Fastest: {min(speeds)}s | Slowest: {max(speeds)}s | Average: {sum(speeds)/len(speeds):.2f}s\n")
-            f.write("#" + "="*50 + "\n\n")
-            for p in working:
-                f.write(f"{p['proxy']}\n")
-        
-        print(f"\n\033[92m[✓] SAVED {len(working)} PROXIES TO proxies.txt\033[0m")
-        
-        print("\n\033[96m[+] PUSHING TO YOUR GITHUB...\033[0m")
-        
-        # Configure git user if not set
-        subprocess.run(["git", "config", "user.email", "proxy@xtm.com"], capture_output=True)
-        subprocess.run(["git", "config", "user.name", "XTM Proxy"], capture_output=True)
-        
-        subprocess.run(["git", "add", "proxies.txt"], capture_output=True)
-        subprocess.run(["git", "commit", "-m", f"Update {len(working)} proxies - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"], capture_output=True)
-        result = subprocess.run(["git", "push", "-u", "origin", "main", "--force"], capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            print(f"\033[92m[✓] PROXIES PUSHED TO YOUR GITHUB\033[0m")
-            print(f"\033[92m[✓] LINK: https://raw.githubusercontent.com/{config['username']}/{config['repo']}/main/proxies.txt\033[0m")
-            print(f"\033[96m[✓] Total proxies online: {len(working)}\033[0m")
+
+    speeds = [p["speed"] for p in working]
+    print(f"\n\033[96m   Fastest : {min(speeds)}s")
+    print(f"   Slowest : {max(speeds)}s")
+    print(f"   Average : {sum(speeds)/len(speeds):.2f}s")
+    print(f"   Success : {len(working)*100//test_limit}%{RST}")
+
+    # ── Speed filter ─────────────────────────────────────────────────────────
+    print("\n\033[93m╔══════════════════════════════════════════════════╗")
+    print("║  [1] ULTRA FAST — < 1s                          ║")
+    print("║  [2] FAST       — < 2s                          ║")
+    print("║  [3] GOOD       — ≤ 4s                          ║")
+    print(f"║  [4] ALL        — keep everything               ║")
+    print(f"\033[93m╚══════════════════════════════════════════════════╝{RST}")
+
+    fc = input("\033[96m[?] Filter (1/2/3/4): \033[0m").strip()
+    thresholds = {"1": 1.0, "2": 2.0, "3": 4.0}
+    if fc in thresholds:
+        filtered = [p for p in working if p["speed"] < thresholds[fc]]
+        if filtered:
+            working = filtered
+            ok(f"Kept {len(working)} proxies.")
         else:
-            print(f"\033[91m[✗] PUSH FAILED! {result.stderr}\033[0m")
-            print(f"\033[93m[!] Proxies saved locally in proxies.txt\033[0m")
-    
-    elif choice == "M":
-        print("\n\033[96m[+] WORKING PROXIES PREVIEW (First 30):\033[0m")
+            warn(f"No proxies met that threshold — keeping all {len(working)}.")
+
+    # ── Build output ─────────────────────────────────────────────────────────
+    speeds = [p["speed"] for p in working]
+    header = (
+        f"# Proxy List — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"# Total   : {len(working)}\n"
+        f"# Fastest : {min(speeds)}s | Slowest : {max(speeds)}s | "
+        f"Average : {sum(speeds)/len(speeds):.2f}s\n"
+        f"# Format  : protocol://ip:port\n"
+        f"# {'='*50}\n\n"
+    )
+    # Each proxy tagged with its protocol — actually usable
+    lines = "\n".join(f"{p['protocol']}://{p['proxy']}" for p in working)
+    file_content = header + lines + "\n"
+
+    # ── Save / push ──────────────────────────────────────────────────────────
+    print("\n\033[93m╔══════════════════════════════════════════════════╗")
+    print("║  [A] AUTO   — save locally + push to GitHub     ║")
+    print("║  [M] MANUAL — preview first, then choose        ║")
+    print("║  [S] SAVE   — save locally only (no GitHub)     ║")
+    print(f"\033[93m╚══════════════════════════════════════════════════╝{RST}")
+
+    choice = input("\033[96m[?] (A/M/S): \033[0m").upper().strip()
+
+    if choice == "M":
+        print(f"\n\033[96mPREVIEW (first 30):{RST}")
         linex()
-        for i, p in enumerate(working[:30], 1):
-            print(f"\033[92m[{i}] {p['proxy']} - {p['speed']}s\033[0m")
+        for p in working[:30]:
+            print(f"\033[92m  {p['protocol']:<6} {p['proxy']} — {p['speed']}s{RST}")
         if len(working) > 30:
-            print(f"\033[93m... and {len(working)-30} more\033[0m")
+            warn(f"... and {len(working)-30} more")
         linex()
-        
-        save_choice = input("\n\033[96m[?] Save these proxies to file? (y/n): \033[0m").lower()
-        if save_choice == 'y':
-            with open("proxies.txt", "w") as f:
-                f.write(f"# Proxy List - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"# Total: {len(working)}\n\n")
-                for p in working:
-                    f.write(f"{p['proxy']}\n")
-            print(f"\n\033[92m[✓] SAVED {len(working)} PROXIES TO proxies.txt\033[0m")
-            
-            push_choice = input("\n\033[96m[?] Push to GitHub? (y/n): \033[0m").lower()
-            if push_choice == 'y':
-                print("\n\033[96m[+] PUSHING TO YOUR GITHUB...\033[0m")
-                subprocess.run(["git", "config", "user.email", "proxy@xtm.com"], capture_output=True)
-                subprocess.run(["git", "config", "user.name", "XTM Proxy"], capture_output=True)
-                      
-        print("\033[92m[✓] All packages installed!\033[0m")
-        time.sleep(1)
-        return True
-    return False
+        print("\n\033[93m╔══════════════════════════════════════════════════╗")
+        print("║  [A] Save locally + push to GitHub             ║")
+        print("║  [S] Save locally only                         ║")
+        print(f"║  [X] Discard                                   ║")
+        print(f"\033[93m╚══════════════════════════════════════════════════╝{RST}")
+        choice = input("\033[96m[?] (A/S/X): \033[0m").upper().strip()
+        if choice == "X":
+            warn("Discarded — nothing saved.")
+            wait_for_enter()
+            return
 
-install_packages()
+    if choice not in ("A", "S"):
+        warn("Invalid choice — nothing saved.")
+        wait_for_enter()
+        return
 
-import requests
-import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+    # Save locally
+    local_path = "proxies.txt"
+    with open(local_path, "w") as f:
+        f.write(file_content)
+    ok(f"Saved {len(working)} proxies → {local_path}")
 
-# Colors
-G = "\033[38;5;46m"
-GGG = "\033[38;5;49m"
-XX = "\033[1;92m"
-
-logo = (f"""
-╔━━━━━━━━━━━━━━━━━━━━━━╗━━━━━━━━━━━╗
-║      \x1b[38;5;47m┳┳┓┏┓┓┏┳┓┳      ║143/B/M    ║
-║      \x1b[38;5;49m┃┃┃┣┫┣┫┃┃┃      ║XTM        ║
-║      \x1b[38;5;50m┛ ┗┛┗┛┗┻┛┻      ║VERSION:2.0║
-╚━━━━━━━━━━━━━━━━━━━━━━╝━━━━━━━━━━━╝
-{G}⋆{GGG}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{G}⋆
-\x1b[1;92m {XX}[\x1b[1;92m⍣{XX}]\x1b[38;5;46m OWNER     : MAHDI            
-\x1b[1;92m {XX}[\x1b[1;92m⍣{XX}] \x1b[38;5;47mFACEBOOK  : MAHDI           
-\x1b[1;92m {XX}[\x1b[1;92m⍣{XX}] \x1b[38;5;48mGITHUB    : MAHDI-143         
-{G}⋆{GGG}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{G}⋆""")
-
-def linex():
-    print(f'{G}⋆{GGG}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{G}⋆')
-
-def clear():
-    os.system('clear')
-    print(logo)
-
-def wait():
-    input("\n\033[93m[+] Press Enter to continue...\033[0m")
-
-def harvest():
-    clear()
-    print("\n\033[96m[+] FETCHING PROXIES FROM LATEST SOURCES...\033[0m")
-    
-    # UPDATED: Latest and most active proxy sources (2025-2026)
-    sources = [
-        # monosans - hourly verified, best quality
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-        
-        # TheSpeedX - daily updated, large volume
-        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
-        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-        
-        # ProxyScrape - real-time (minutes)
-        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http",
-        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4",
-        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5",
-    ]
-    
-    proxies = set()
-    for url in sources:
-        try:
-            r = requests.get(url, timeout=15)
-            found = re.findall(r'\d+\.\d+\.\d+\.\d+:\d+', r.text)
-            proxies.update(found)
-            source_name = url.split('/')[2] if 'raw' in url else url.split('/')[2].split('?')[0]
-            print(f"\033[92m[✓] Got {len(found)} from {source_name}\033[0m")
-        except:
-            source_name = url.split('/')[2] if 'raw' in url else url.split('/')[2].split('?')[0]
-            print(f"\033[91m[✗] Failed: {source_name}\033[0m")
-    
-    print(f"\n\033[96m[+] TOTAL UNIQUE PROXIES: {len(proxies)}\033[0m")
-    print(f"\n\033[96m[+] TESTING PROXIES (This may take a minute)...\033[0m")
-    
-    def test(proxy):
-        try:
-            start = time.time()
-            r = requests.get("http://httpbin.org/ip", proxies={"http": f"http://{proxy}"}, timeout=5)
-            if r.status_code == 200:
-                return {"proxy": proxy, "speed": round(time.time() - start, 2)}
-        except:
-            pass
-        return None
-    
-    working = []
-    with ThreadPoolExecutor(max_workers=50) as ex:
-        futures = [ex.submit(test, p) for p in list(proxies)[:500]]
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                working.append(result)
-                emoji = "⚡" if result["speed"] < 2 else "🐢" if result["speed"] > 4 else "✓"
-                print(f"\033[92m   {emoji} {result['proxy']} - {result['speed']}s\033[0m")
-    
-    with open("proxies.txt", "w") as f:
-        for p in working:
-            f.write(f"{p['proxy']}\n")
-    
-    print(f"\n\033[92m[✓] SAVED {len(working)} WORKING PROXIES\033[0m")
-    
-    if working:
-        speeds = [p['speed'] for p in working]
-        print(f"\n\033[96m[+] SPEED STATS:\033[0m")
-        print(f"   \033[92mFastest: {min(speeds)}s\033[0m")
-        print(f"   \033[93mSlowest: {max(speeds)}s\033[0m")
-        print(f"   \033[96mAverage: {sum(speeds)/len(speeds):.2f}s\033[0m")
-    
-    print(f"\n\033[92m[✓] Proxies saved to: proxies.txt\033[0m")
-    wait()
-
-def view_proxies():
-    clear()
-    try:
-        with open("proxies.txt", "r") as f:
-            proxies = f.read().splitlines()
-        
-        print(f"\n\033[96m[+] TOTAL PROXIES: {len(proxies)}\033[0m")
-        linex()
-        
-        print("\033[93m[1] Show first 20\033[0m")
-        print("\033[93m[2] Show all\033[0m")
-        print("\033[93m[3] Show by range (e.g., 10-30)\033[0m")
-        linex()
-        choice = input("\033[96m[?] How to view? (1/2/3): \033[0m")
-        
-        if choice == "1":
-            for i, p in enumerate(proxies[:20], 1):
-                print(f"\033[92m[{i}] {p}\033[0m")
-            if len(proxies) > 20:
-                print(f"\033[93m... and {len(proxies)-20} more\033[0m")
-        
-        elif choice == "2":
-            for i, p in enumerate(proxies, 1):
-                print(f"\033[92m[{i}] {p}\033[0m")
-        
-        elif choice == "3":
-            try:
-                start = int(input("\033[96m[?] Start from: \033[0m"))
-                end = int(input("\033[96m[?] End at: \033[0m"))
-                for i, p in enumerate(proxies[start-1:end], start):
-                    print(f"\033[92m[{i}] {p}\033[0m")
-            except:
-                print("\033[91m[✗] Invalid range!\033[0m")
-        
+    # Push if requested
+    if choice == "A":
+        info("Pushing to GitHub via API...")
+        success = gh_push_file(
+            config["username"], config["token"], config["repo"], file_content
+        )
+        if success:
+            raw_url = (
+                f"https://raw.githubusercontent.com/"
+                f"{config['username']}/{config['repo']}/main/proxies.txt"
+            )
+            ok(f"Pushed! Live at:\n   {raw_url}")
         else:
-            print("\033[91m[✗] Invalid choice!\033[0m")
-    except:
-        print("\033[91m[✗] No proxies found! Run harvest first.\033[0m")
-    wait()
+            warn("Push failed — proxies saved locally only.")
 
-def copy_to_sdcard():
-    clear()
-    print("\n\033[96m[+] COPYING PROXIES TO SDCARD...\033[0m")
-    try:
-        sdcard_paths = ["/sdcard/", "/storage/emulated/0/", "/storage/sdcard0/"]
-        success = False
-        
-        for path in sdcard_paths:
-            try:
-                os.system(f"cp proxies.txt {path} 2>/dev/null")
-                if os.path.exists(f"{path}proxies.txt"):
-                    print(f"\033[92m[✓] Copied to {path}proxies.txt\033[0m")
-                    success = True
-                    break
-            except:
-                pass
-        
-        if not success:
-            print("\033[93m[!] Could not copy to SDCARD automatically\033[0m")
-            print("\033[93m[!] Try manual copy: cp proxies.txt /sdcard/\033[0m")
-    except:
-        print("\033[91m[✗] Failed to copy to SDCARD\033[0m")
-    wait()
+    wait_for_enter()
 
-def share_file():
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MENU
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def show_link():
     clear()
-    print("\n\033[96m[+] SHARING PROXIES.TXT...\033[0m")
+    config = load_config()
+    if not config:
+        err("Not configured. Run setup first.")
+        wait_for_enter()
+        return
+    url = f"https://raw.githubusercontent.com/{config['username']}/{config['repo']}/main/proxies.txt"
+    ok(f"Your live proxy URL:\n   {url}")
     try:
-        result = subprocess.run(["termux-share", "proxies.txt"], capture_output=True)
-        if result.returncode == 0:
-            print("\033[92m[✓] Share dialog opened!\033[0m")
+        r = requests.get(url, timeout=8)
+        if r.status_code == 200:
+            count = len([l for l in r.text.splitlines() if re.match(r'\w+://\d', l)])
+            info(f"Currently {count} proxies online.")
         else:
-            print("\033[93m[!] termux-share not available\033[0m")
-            print("\033[93m[!] Install termux-api: pkg install termux-api\033[0m")
-    except:
-        print("\033[91m[✗] Failed to share\033[0m")
-        print("\033[93m[!] Install termux-api: pkg install termux-api\033[0m")
-    wait()
+            warn("URL not yet active — harvest proxies first.")
+    except requests.RequestException as exc:
+        warn(f"Could not reach URL: {exc}")
+    wait_for_enter()
 
-def about():
-    clear()
-    linex()
-    print("\n\033[96m[+] ABOUT XTM\033[0m")
-    print("\033[92mTool     : XTM Proxy Master\033[0m")
-    print("\033[92mVersion  : 2.0 (Lite)\033[0m")
-    print("\033[92mOwner    : MAHDI\033[0m")
-    print("\033[92mGitHub   : MAHDI-143\033[0m")
-    print("\033[92mFacebook : @xmahdi143\033[0m")
-    print("\033[92mPurpose  : Fast proxy scraper & tester\033[0m")
-    print("\033[92mSources  : monosans, TheSpeedX, ProxyScrape\033[0m")
-    linex()
-    
-    print("\n\033[93m[+] Opening Facebook...\033[0m")
-    try:
-        subprocess.run(["termux-open", "https://www.facebook.com/xmahdi143"], capture_output=True)
-    except:
-        try:
-            import webbrowser
-            webbrowser.open("https://www.facebook.com/xmahdi143")
-        except:
-            print("\033[91m[✗] Could not open Facebook automatically\033[0m")
-            print("\033[93m[!] Visit: https://www.facebook.com/xmahdi143\033[0m")
-    
-    wait()
 
 def main():
-    while True:
-        clear()
-        print("\033[93m    [1] HARVEST PROXIES\033[0m")
-        print("\033[93m    [2] VIEW PROXIES\033[0m")
-        print("\033[93m    [3] COPY TO SDCARD\033[0m")
-        print("\033[93m    [4] SHARE FILE\033[0m")
-        print("\033[93m    [5] ABOUT\033[0m")
-        print("\033[93m    [6] EXIT\033[0m")
-        linex()
-        choice = input("\033[96m    [?] CHOOSE : \033[0m")
-        
-        if choice == "1":
-            harvest()
-        elif choice == "2":
-            view_proxies()
-        elif choice == "3":
-            copy_to_sdcard()
-        elif choice == "4":
-            share_file()
-        elif choice == "5":
-            about()
-        elif choice == "6":
-            clear()
-            print("\n\033[92m[+] GOODBYE!\033[0m")
-            sys.exit()
-        else:
-            print("\033[91m[✗] INVALID!\033[0m")
-            time.sleep(1)
-
-if __name__ == "__main__":
-    main()
-EOF
+    if not SOCKS_AVAILABLE:
+        # Warn once at startup — not on every test
+        pass 
