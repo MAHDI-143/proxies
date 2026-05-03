@@ -131,7 +131,7 @@ LOGO = (
     f"{G1}⋆{G2}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{G1}⋆{RST}\n"
     f" {BOLD}[{G1}•{BOLD}]{G1} OWNER     : SERK{RST}\n"
     f" {BOLD}[{G1}•{BOLD}]{G1} GITHUB    : MAHDI-143{RST}\n"
-    f" {BOLD}[{G1}•{BOLD}]{G1} VERSION   : 3.2{RST}\n"
+    f" {BOLD}[{G1}•{BOLD}]{G1} VERSION   : 1.5{RST}\n"
     f"{G1}⋆{G2}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{G1}⋆{RST}"
 )
 
