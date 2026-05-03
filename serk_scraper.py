@@ -332,6 +332,7 @@ GITHUB_SOURCES: dict[str, list[str]] = {
         "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all",
         "https://proxy-list.download/api/v1/get?type=http",
         "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+        "https://free-proxy-list.net/en/",
     ],
     "socks4": [
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
